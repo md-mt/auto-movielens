@@ -34,7 +34,7 @@ log = logging.getLogger("train")
 DATASET = os.environ.get("DATASET", "ml-1m")
 EVALS_PER_EPOCH = 3
 PATIENCE = 6
-TIME_PER_MODEL = 60  # seconds per model variant
+TIME_PER_MODEL = 45  # seconds per model variant (adjusted per remaining budget)
 
 # ─── Device ─────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -343,22 +343,42 @@ VARIANTS = [
     {"name": "no_dropout",       "hidden": (256, 128, 64), "dropout": 0.0},
     {"name": "no_bias",          "hidden": (256, 128, 64), "dropout": 0.1, "use_bias": False},
     {"name": "no_genre",         "hidden": (256, 128, 64), "dropout": 0.1, "use_genres": False},
+    {"name": "no_bias_no_genre", "hidden": (256, 128, 64), "dropout": 0.1, "use_bias": False, "use_genres": False},
+    {"name": "wide_shallow",     "hidden": (512, 128), "dropout": 0.1},
+    {"name": "narrow_deep",      "hidden": (128, 64, 32, 16), "dropout": 0.05},
     # --- Training diversity ---
     {"name": "lr_low",           "lr": 3e-4},
     {"name": "lr_high",          "lr": 3e-3},
+    {"name": "lr_very_low",      "lr": 1e-4},
     {"name": "batch4096",        "batch_size": 4096},
     {"name": "batch1024",        "batch_size": 1024},
+    {"name": "batch8192",        "batch_size": 8192},
     {"name": "no_recency_wt",    "recency_strength": 0.0},
     {"name": "mild_recency",     "recency_strength": 1.0},
     {"name": "strong_recency",   "recency_strength": 3.0},
-    # --- Data diversity (recency splits) ---
+    {"name": "very_strong_rec",  "recency_strength": 5.0},
+    {"name": "wd_high",          "wd": 1e-4},
+    {"name": "wd_zero",          "wd": 0.0},
+    # --- Data diversity (recency splits — biggest ensemble diversity source) ---
+    {"name": "recent90",         "data_frac": 0.9},
     {"name": "recent80",         "data_frac": 0.8},
+    {"name": "recent70",         "data_frac": 0.7},
     {"name": "recent60",         "data_frac": 0.6},
+    {"name": "recent50",         "data_frac": 0.5},
     {"name": "recent40",         "data_frac": 0.4},
+    {"name": "recent30",         "data_frac": 0.3},
+    {"name": "recent20",         "data_frac": 0.2},
+    # --- Recency splits × architecture combos ---
+    {"name": "recent50_narrow",  "data_frac": 0.5, "hidden": (128, 64, 32)},
+    {"name": "recent50_nobias",  "data_frac": 0.5, "use_bias": False},
+    {"name": "recent70_wide",    "data_frac": 0.7, "hidden": (512, 256, 128)},
+    {"name": "recent80_norec",   "data_frac": 0.8, "recency_strength": 0.0},
     # --- Seed diversity ---
     {"name": "seed43",           "seed": 43},
     {"name": "seed44",           "seed": 44},
     {"name": "seed45",           "seed": 45},
+    {"name": "seed100",          "seed": 100},
+    {"name": "seed200",          "seed": 200},
 ]
 
 
