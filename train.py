@@ -78,30 +78,43 @@ for _, row in movies_df.iterrows():
             if g in genre_to_idx:
                 movie_genres[mid, genre_to_idx[g]] = 1.0
 
-# 2. User and item statistics with rating histograms
-# 6 features each: log_count, frac_1-2, frac_2.5-3, frac_3.5, frac_4-4.5, frac_5
+# 2. User and item statistics with rating histograms + raw mean
 RATING_BINS = [(0, 2.5), (2.5, 3.5), (3.5, 4.0), (4.0, 4.5), (4.5, 5.5)]
 NUM_BINS = len(RATING_BINS)
-STAT_DIM = 1 + NUM_BINS  # log_count + 5 histogram bins
-NUM_DENSE = 1 + 2 * STAT_DIM  # timestamp + user_stats + item_stats
+# 7 features each: log_count, mean_rating, pos_rate, 5 histogram bins
+STAT_DIM = 2 + NUM_BINS + 1  # log_count + mean + pos_rate + 5 bins
+global_mean = float(train_df["rating"].mean())
+global_pos_rate = float(train_df["label"].mean())
 
 user_stats = np.zeros((num_users, STAT_DIM), dtype=np.float32)
 item_stats = np.zeros((num_items, STAT_DIM), dtype=np.float32)
-# Default: uniform distribution for missing users/items
-user_stats[:, 1:] = 1.0 / NUM_BINS
-item_stats[:, 1:] = 1.0 / NUM_BINS
+# Defaults for missing users/items
+user_stats[:, 1] = global_mean
+user_stats[:, 2] = global_pos_rate
+user_stats[:, 3:] = 1.0 / NUM_BINS
+item_stats[:, 1] = global_mean
+item_stats[:, 2] = global_pos_rate
+item_stats[:, 3:] = 1.0 / NUM_BINS
 
 for uid, group in train_df.groupby("userId"):
     r = group["rating"].values.astype(np.float32)
+    labels = group["label"].values.astype(np.float32)
     user_stats[uid, 0] = np.log1p(len(r))
+    user_stats[uid, 1] = r.mean()
+    user_stats[uid, 2] = labels.mean()
     for b, (lo, hi) in enumerate(RATING_BINS):
-        user_stats[uid, 1 + b] = ((r >= lo) & (r < hi)).mean()
+        user_stats[uid, 3 + b] = ((r >= lo) & (r < hi)).mean()
 
 for mid, group in train_df.groupby("movieId"):
     r = group["rating"].values.astype(np.float32)
+    labels = group["label"].values.astype(np.float32)
     item_stats[mid, 0] = np.log1p(len(r))
+    item_stats[mid, 1] = r.mean()
+    item_stats[mid, 2] = labels.mean()
     for b, (lo, hi) in enumerate(RATING_BINS):
-        item_stats[mid, 1 + b] = ((r >= lo) & (r < hi)).mean()
+        item_stats[mid, 3 + b] = ((r >= lo) & (r < hi)).mean()
+
+NUM_DENSE = 1 + 2 * STAT_DIM  # timestamp + user_stats + item_stats
 
 # 3. User history sequences
 PAD_IDX = num_items
