@@ -114,19 +114,27 @@ for mid, group in train_df.groupby("movieId"):
     for b, (lo, hi) in enumerate(RATING_BINS):
         item_stats[mid, 3 + b] = ((r >= lo) & (r < hi)).mean()
 
-NUM_DENSE = 1 + 2 * STAT_DIM  # timestamp + user_stats + item_stats
+NUM_DENSE = 3 + 2 * STAT_DIM  # timestamp + user_recency + item_recency + user_stats + item_stats
 
-# 3. User history sequences
+# 3. Temporal features: last interaction timestamp per user/item
+ts_min = float(train_df["timestamp"].min())
+ts_max = float(train_df["timestamp"].max())
+ts_range = ts_max - ts_min + 1.0
+
+user_last_ts = np.full(num_users, ts_min, dtype=np.float64)
+item_last_ts = np.full(num_items, ts_min, dtype=np.float64)
+for uid, group in train_df.groupby("userId"):
+    user_last_ts[uid] = group["timestamp"].max()
+for mid, group in train_df.groupby("movieId"):
+    item_last_ts[mid] = group["timestamp"].max()
+
+# 4. User history sequences
 PAD_IDX = num_items
 user_histories = np.full((num_users, HISTORY_LEN), PAD_IDX, dtype=np.int64)
 for uid, group in train_df.groupby("userId"):
     items = group["movieId"].values
     seq = items[-HISTORY_LEN:]
     user_histories[uid, -len(seq):] = seq
-
-# 4. Timestamp normalization
-ts_min = float(train_df["timestamp"].min())
-ts_range = float(train_df["timestamp"].max() - ts_min) + 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -137,8 +145,13 @@ def build_tensors(df):
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
-    ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
-    dense = np.column_stack([ts_norm, user_stats[uids], item_stats[mids]]).astype(np.float32)
+    ts = df["timestamp"].values.astype(np.float64)
+    ts_norm = ((ts - ts_min) / ts_range).astype(np.float32)
+    # Recency: how long ago was the user/item's last training interaction?
+    user_recency = ((ts - user_last_ts[uids]) / ts_range).astype(np.float32)
+    item_recency = ((ts - item_last_ts[mids]) / ts_range).astype(np.float32)
+    dense = np.column_stack([ts_norm, user_recency, item_recency,
+                             user_stats[uids], item_stats[mids]]).astype(np.float32)
     hist = user_histories[uids]
     genres = movie_genres[mids]
     return (
