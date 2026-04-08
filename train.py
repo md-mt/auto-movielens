@@ -79,8 +79,12 @@ for _, row in movies_df.iterrows():
                 movie_genres[mid, genre_to_idx[g]] = 1.0
 
 # 2. User and item statistics (computed on train only)
+# Use sensible defaults for users/items with no training data
+global_mean = float(train_df["rating"].mean())
 user_stats = np.zeros((num_users, 3), dtype=np.float32)
+user_stats[:, 1] = global_mean  # default mean rating
 item_stats = np.zeros((num_items, 3), dtype=np.float32)
+item_stats[:, 1] = global_mean  # default mean rating
 
 for uid, group in train_df.groupby("userId"):
     r = group["rating"].values.astype(np.float32)
@@ -90,11 +94,9 @@ for mid, group in train_df.groupby("movieId"):
     r = group["rating"].values.astype(np.float32)
     item_stats[mid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
 
-for arr in [user_stats, item_stats]:
-    for col in range(arr.shape[1]):
-        mu = arr[:, col].mean()
-        sigma = arr[:, col].std() + 1e-8
-        arr[:, col] = (arr[:, col] - mu) / sigma
+# Normalize count with log, leave mean/std raw (informative scale)
+user_stats[:, 0] = np.log1p(user_stats[:, 0])
+item_stats[:, 0] = np.log1p(item_stats[:, 0])
 
 # 3. User history sequences
 PAD_IDX = num_items
@@ -142,22 +144,30 @@ log.info(f"Tensors on GPU. Train: {n_train}, Val: {n_val}")
 # MODEL
 # ═══════════════════════════════════════════════════════════════════
 
-class DLRM(nn.Module):
+class RecModel(nn.Module):
+    """Wide & Deep with additive logits."""
+
     def __init__(self):
         super().__init__()
         D = EMBED_DIM
         self.user_embed = nn.Embedding(num_users, D)
         self.item_embed = nn.Embedding(num_items, D)
         self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
-        self.bottom_mlp = nn.Sequential(
-            nn.Linear(NUM_DENSE, 64), nn.ReLU(),
-            nn.Linear(64, D), nn.ReLU(),
+        self.genre_proj = nn.Linear(num_genres, D)
+
+        # Wide: raw dense + genres → logit
+        self.wide = nn.Sequential(
+            nn.Linear(NUM_DENSE + num_genres, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 1),
         )
-        self.genre_proj = nn.Sequential(nn.Linear(num_genres, D), nn.ReLU())
-        self.top_mlp = nn.Sequential(
-            nn.Linear(10 + 5 * D, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(128, 1),
+
+        # Deep: embeddings → logit
+        deep_in = 1 + 4 * D
+        self.deep = nn.Sequential(
+            nn.Linear(deep_in, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 1),
         )
         self._init_weights()
 
@@ -178,20 +188,16 @@ class DLRM(nn.Module):
         hist_e = self.hist_embed(history)
         mask = (history != PAD_IDX).unsqueeze(-1).float()
         hist_e = (hist_e * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-        dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
 
-        vecs = [user_e, item_e, hist_e, dense_e, genre_e]
-        dots = []
-        for i in range(len(vecs)):
-            for j in range(i + 1, len(vecs)):
-                dots.append((vecs[i] * vecs[j]).sum(dim=-1, keepdim=True))
+        dot = (user_e * item_e).sum(dim=-1, keepdim=True)
+        deep_out = self.deep(torch.cat([dot, user_e, item_e, hist_e, genre_e], dim=-1))
+        wide_out = self.wide(torch.cat([dense, genres], dim=-1))
 
-        out = torch.cat(dots + vecs, dim=-1)
-        return self.top_mlp(out).squeeze(-1)
+        return (wide_out + deep_out).squeeze(-1)
 
 
-model = DLRM().to(DEVICE)
+model = RecModel().to(DEVICE)
 num_params = sum(p.numel() for p in model.parameters())
 log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 
