@@ -40,7 +40,7 @@ LR = 1e-3
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
-NUM_DENSE = 7  # 1 timestamp + 3 user stats + 3 item stats
+# NUM_DENSE is computed dynamically after feature engineering
 EVALS_PER_EPOCH = 3  # sub-epoch evaluation
 PATIENCE = 6  # early stop after N evals with no improvement
 
@@ -78,25 +78,30 @@ for _, row in movies_df.iterrows():
             if g in genre_to_idx:
                 movie_genres[mid, genre_to_idx[g]] = 1.0
 
-# 2. User and item statistics (computed on train only)
-# Use sensible defaults for users/items with no training data
-global_mean = float(train_df["rating"].mean())
-user_stats = np.zeros((num_users, 3), dtype=np.float32)
-user_stats[:, 1] = global_mean  # default mean rating
-item_stats = np.zeros((num_items, 3), dtype=np.float32)
-item_stats[:, 1] = global_mean  # default mean rating
+# 2. User and item statistics with rating histograms
+# 6 features each: log_count, frac_1-2, frac_2.5-3, frac_3.5, frac_4-4.5, frac_5
+RATING_BINS = [(0, 2.5), (2.5, 3.5), (3.5, 4.0), (4.0, 4.5), (4.5, 5.5)]
+NUM_BINS = len(RATING_BINS)
+STAT_DIM = 1 + NUM_BINS  # log_count + 5 histogram bins
+NUM_DENSE = 1 + 2 * STAT_DIM  # timestamp + user_stats + item_stats
+
+user_stats = np.zeros((num_users, STAT_DIM), dtype=np.float32)
+item_stats = np.zeros((num_items, STAT_DIM), dtype=np.float32)
+# Default: uniform distribution for missing users/items
+user_stats[:, 1:] = 1.0 / NUM_BINS
+item_stats[:, 1:] = 1.0 / NUM_BINS
 
 for uid, group in train_df.groupby("userId"):
     r = group["rating"].values.astype(np.float32)
-    user_stats[uid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
+    user_stats[uid, 0] = np.log1p(len(r))
+    for b, (lo, hi) in enumerate(RATING_BINS):
+        user_stats[uid, 1 + b] = ((r >= lo) & (r < hi)).mean()
 
 for mid, group in train_df.groupby("movieId"):
     r = group["rating"].values.astype(np.float32)
-    item_stats[mid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
-
-# Normalize count with log, leave mean/std raw (informative scale)
-user_stats[:, 0] = np.log1p(user_stats[:, 0])
-item_stats[:, 0] = np.log1p(item_stats[:, 0])
+    item_stats[mid, 0] = np.log1p(len(r))
+    for b, (lo, hi) in enumerate(RATING_BINS):
+        item_stats[mid, 1 + b] = ((r >= lo) & (r < hi)).mean()
 
 # 3. User history sequences
 PAD_IDX = num_items
