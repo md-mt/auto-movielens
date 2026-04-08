@@ -17,7 +17,8 @@ import torch
 import torch.nn as nn
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import cross_val_predict
-from prepare import load_data, evaluate, print_summary, TIME_BUDGET
+from prepare import load_data, evaluate, print_summary, TIME_BUDGET as _TIME_BUDGET
+TIME_BUDGET = 1800  # 30 min for ensemble (need time for 40+ models + stacking)
 
 # ─── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
