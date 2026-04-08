@@ -323,10 +323,30 @@ def _build_gpu_tensors(df):
         torch.from_numpy(labels).to(DEVICE),
     )
 
+# Store full train_df for recency-diverse training
+_full_train_df = train_df.copy()
+
 log.info("Precomputing training tensors on GPU...")
 train_uids, train_mids, train_dense, train_labels = _build_gpu_tensors(train_df)
 n_train = len(train_labels)
 n_batches_per_epoch = n_train // BATCH_SIZE
+
+# Pre-compute recency-filtered training data variants
+_recency_variants = {}
+def get_recency_data(frac):
+    if frac not in _recency_variants:
+        if frac >= 0.99:
+            _recency_variants[frac] = (train_uids, train_mids, train_dense, train_labels)
+        else:
+            real_mask = _full_train_df["rating"] > 0
+            real_ratings = _full_train_df[real_mask].sort_values("timestamp")
+            cutoff = int(len(real_ratings) * (1 - frac))
+            keep_real = real_ratings.iloc[cutoff:].index
+            keep_neg = _full_train_df[~real_mask].index
+            subset = _full_train_df.loc[keep_real.union(keep_neg)].reset_index(drop=True)
+            _recency_variants[frac] = _build_gpu_tensors(subset)
+            log.info(f"  Built recency={frac:.0%} data: {len(subset)} samples")
+    return _recency_variants[frac]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -416,274 +436,330 @@ def run_eval():
 # ═══════════════════════════════════════════════════════════════════
 
 class DLRM(nn.Module):
-    def __init__(self):
+    def __init__(self, embed_dim=EMBED_DIM, use_din=True, use_item_din=True,
+                 use_causal_sa=True, use_genome=True, use_field_attn=True,
+                 use_streams=True):
         super().__init__()
-        D = EMBED_DIM
+        D = embed_dim
+        self.D = D
+        self.use_din = use_din
+        self.use_item_din = use_item_din
+        self.use_causal_sa = use_causal_sa
+        self.use_genome = use_genome
+        self.use_field_attn = use_field_attn
+        self.use_streams = use_streams
 
         self.user_embed = nn.Embedding(num_users, D)
         self.item_embed = nn.Embedding(num_items, D)
         self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
-        self.rater_embed = nn.Embedding(num_users + 1, D, padding_idx=USER_PAD_IDX)
-
-        # Rating projection: scalar rating → D-dim vector
         self.rating_proj = nn.Linear(1, D)
 
-        # Lightweight causal self-attention on history (single head, no FFN)
-        self.hist_q = nn.Linear(D, D, bias=False)
-        self.hist_k = nn.Linear(D, D, bias=False)
-        self.hist_v = nn.Linear(D, D, bias=False)
+        if use_causal_sa:
+            self.hist_q = nn.Linear(D, D, bias=False)
+            self.hist_k = nn.Linear(D, D, bias=False)
+            self.hist_v = nn.Linear(D, D, bias=False)
 
-        # DIN: target-item-aware attention over history
-        self.din_attn = nn.Sequential(
-            nn.Linear(3 * 2 * D, 64),  # 2*D per position (item+rating), 3 groups
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        if use_din:
+            self.din_attn = nn.Sequential(nn.Linear(3*2*D, 64), nn.ReLU(), nn.Linear(64, 1))
 
-        # Item-side DIN: target-user-aware attention over recent raters
-        self.item_din_attn = nn.Sequential(
-            nn.Linear(3 * 2 * D, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        if use_item_din:
+            self.rater_embed = nn.Embedding(num_users + 1, D, padding_idx=USER_PAD_IDX)
+            self.item_din_attn = nn.Sequential(nn.Linear(3*2*D, 64), nn.ReLU(), nn.Linear(64, 1))
 
-        self.bottom_mlp = nn.Sequential(
-            nn.Linear(NUM_DENSE, 128),
-            nn.ReLU(),
-            nn.Linear(128, D),
-            nn.ReLU(),
-        )
+        self.bottom_mlp = nn.Sequential(nn.Linear(NUM_DENSE, 128), nn.ReLU(), nn.Linear(128, D), nn.ReLU())
+        self.genre_proj = nn.Sequential(nn.Linear(num_genres, D), nn.ReLU())
 
-        self.genre_proj = nn.Sequential(
-            nn.Linear(num_genres, D),
-            nn.ReLU(),
-        )
+        if use_genome:
+            self.genome_proj = nn.Sequential(
+                nn.Linear(GENOME_DIM, 256), nn.ReLU(),
+                nn.Linear(256, 64), nn.ReLU(), nn.Dropout(0.1),
+                nn.Linear(64, D),
+            )
+            self.genome_gate = nn.Linear(D, D)
 
-        # Tag genome: learned bottleneck compression 1128 → D with gating
-        self.genome_proj = nn.Sequential(
-            nn.Linear(GENOME_DIM, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, D),
-        )
-        self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
+        # Count fields: user, item, user_hist, dense, genre + optional(item_hist, genome)
+        n_fields = 5 + (1 if use_item_din else 0) + (1 if use_genome else 0)
+        cross_dim = n_fields * D
 
-        # Field-level self-attention (replaces GDCN cross layers)
-        cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
-        self.field_attn = nn.MultiheadAttention(D, num_heads=1, batch_first=True, dropout=0.1)
+        if use_field_attn:
+            self.field_attn = nn.MultiheadAttention(D, num_heads=1, batch_first=True, dropout=0.1)
 
-        # Two-stream MLPs (FinalMLP-style)
-        # User stream: user_e + user_hist_e + dense_e = 3*D
-        self.user_stream = nn.Sequential(
-            nn.Linear(3 * D, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 64), nn.ReLU(),
-        )
-        # Item stream: item_e + item_hist_e + genre_e + genome_e = 4*D
-        self.item_stream = nn.Sequential(
-            nn.Linear(4 * D, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 64), nn.ReLU(),
-        )
+        if use_streams:
+            self.user_stream = nn.Sequential(nn.Linear(3*D, 256), nn.ReLU(), nn.Dropout(0.2), nn.Linear(256, 64), nn.ReLU())
+            item_stream_in = (3 + (1 if use_genome else 0)) * D
+            self.item_stream = nn.Sequential(nn.Linear(item_stream_in, 256), nn.ReLU(), nn.Dropout(0.2), nn.Linear(256, 64), nn.ReLU())
+            top_in = cross_dim + 64 + 64 + 64
+        else:
+            top_in = cross_dim
 
-        # Top MLP: cross-network + streams + bilinear
         self.top_mlp = nn.Sequential(
-            nn.Linear(cross_dim + 64 + 64 + 64, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(top_in, 256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1),
         )
-
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, 0.0, 0.01)
-                if m.padding_idx is not None:
-                    nn.init.zeros_(m.weight[m.padding_idx])
+                if m.padding_idx is not None: nn.init.zeros_(m.weight[m.padding_idx])
 
     def forward(self, user_id, movie_id, dense, history, hist_ratings,
                 genres, item_hist, item_hist_ratings, genome_raw, has_genome_mask):
+        D = self.D
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
-        # --- User-side: causal self-attention + DIN ---
-        raw_hist_item_e = self.hist_embed(history)                     # (B, L, D) — save raw
-        hist_item_e = raw_hist_item_e
-        hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
-        # Causal self-attention on item embeddings
-        Q = self.hist_q(hist_item_e)                                   # (B, L, D)
-        K = self.hist_k(hist_item_e)                                   # (B, L, D)
-        V = self.hist_v(hist_item_e)                                   # (B, L, D)
-        scale = Q.size(-1) ** 0.5
-        causal_scores = torch.bmm(Q, K.transpose(1, 2)) / scale       # (B, L, L)
-        # Causal mask + padding
-        L = history.size(1)
-        causal_mask = torch.triu(torch.full((L, L), -1e4, device=history.device), diagonal=1)
-        pad_mask = (history == PAD_IDX).unsqueeze(1).expand(-1, L, -1) # (B, L, L)
-        causal_scores = causal_scores + causal_mask.unsqueeze(0)
-        causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
-        causal_weights = torch.softmax(causal_scores, dim=-1)
-        hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e   # (B, L, D) — contextual + residual
-        # DIN on contextual+residual embeddings
-        hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
-        target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
-        target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
-        attn_in = torch.cat([hist_e_raw, target_exp, hist_e_raw * target_exp], dim=-1)
-        attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
-        attn_w = attn_w.masked_fill(history == PAD_IDX, -1e4)
-        attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
-        user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
+        # User history
+        raw_hist = self.hist_embed(history)
+        hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))
+        hist_item_e = raw_hist
 
-        # --- Item-side DIN: attention over users who rated this item ---
-        rater_e = nn.functional.dropout(self.rater_embed(item_hist), 0.1, self.training)  # (B, IL, D)
-        rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
-        rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
-        query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
-        query_exp = query_e.unsqueeze(1).expand_as(rater_e_raw)       # (B, IL, 2D)
-        item_attn_in = torch.cat([rater_e_raw, query_exp, rater_e_raw * query_exp], dim=-1)
-        item_attn_w = self.item_din_attn(item_attn_in).squeeze(-1)    # (B, IL)
-        item_attn_w = item_attn_w.masked_fill(item_hist == USER_PAD_IDX, -1e4)
-        item_attn_w = torch.softmax(item_attn_w, dim=-1).unsqueeze(-1)
-        item_hist_e = (rater_e * item_attn_w).sum(dim=1)              # (B, D)
+        if self.use_causal_sa:
+            Q, K, V = self.hist_q(hist_item_e), self.hist_k(hist_item_e), self.hist_v(hist_item_e)
+            scores = torch.bmm(Q, K.transpose(1,2)) / (D**0.5)
+            L = history.size(1)
+            cmask = torch.triu(torch.full((L,L), -1e4, device=history.device), diagonal=1)
+            pmask = (history == PAD_IDX).unsqueeze(1).expand(-1, L, -1)
+            scores = (scores + cmask.unsqueeze(0)).masked_fill(pmask, -1e4)
+            hist_item_e = torch.bmm(torch.softmax(scores, dim=-1), V) + raw_hist
+
+        if self.use_din:
+            h = torch.cat([hist_item_e, hist_rat_e], dim=-1)
+            t = torch.cat([item_e, item_e], dim=-1).unsqueeze(1).expand_as(h)
+            w = self.din_attn(torch.cat([h, t, h*t], dim=-1)).squeeze(-1)
+            w = w.masked_fill(history == PAD_IDX, -1e4)
+            user_hist_e = (hist_item_e * torch.softmax(w, dim=-1).unsqueeze(-1)).sum(dim=1)
+        else:
+            mask = (history != PAD_IDX).unsqueeze(-1).float()
+            user_hist_e = (hist_item_e * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+
+        # Item history (raters)
+        if self.use_item_din:
+            re = nn.functional.dropout(self.rater_embed(item_hist), 0.1, self.training)
+            rr = self.rating_proj(item_hist_ratings.unsqueeze(-1))
+            h = torch.cat([re, rr], dim=-1)
+            q = torch.cat([user_e, user_e], dim=-1).unsqueeze(1).expand_as(h)
+            w = self.item_din_attn(torch.cat([h, q, h*q], dim=-1)).squeeze(-1)
+            w = w.masked_fill(item_hist == USER_PAD_IDX, -1e4)
+            item_hist_e = (re * torch.softmax(w, dim=-1).unsqueeze(-1)).sum(dim=1)
 
         dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
 
-        # Tag genome: learned compression with gating
-        genome_e = self.genome_proj(genome_raw)                           # (B, D)
-        gate = torch.sigmoid(self.genome_gate(genome_e))                  # (B, D)
-        genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
+        # Genome
+        if self.use_genome:
+            ge = self.genome_proj(genome_raw)
+            gate = torch.sigmoid(self.genome_gate(ge))
+            genome_field = gate * ge + (1 - gate) * item_e.detach()
 
-        # Stack 7 fields as sequence and apply field-level self-attention
-        fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
-        attn_out, _ = self.field_attn(fields, fields, fields)  # (B, 7, D)
-        x4 = (fields + attn_out).reshape(fields.size(0), -1)  # (B, 7*D) — residual + flatten
+        # Assemble fields
+        field_list = [user_e, item_e, user_hist_e]
+        if self.use_item_din:
+            field_list.append(item_hist_e)
+        field_list.extend([dense_e, genre_e])
+        if self.use_genome:
+            field_list.append(genome_field)
 
-        # Two-stream processing
-        user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
-        item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e, genome_field], dim=-1))
+        fields = torch.stack(field_list, dim=1)
 
-        # Bilinear interaction between streams
-        bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
+        if self.use_field_attn:
+            attn_out, _ = self.field_attn(fields, fields, fields)
+            x = (fields + attn_out).reshape(fields.size(0), -1)
+        else:
+            x = fields.reshape(fields.size(0), -1)
 
-        # Combine cross-network + streams + bilinear
-        combined = torch.cat([x4, user_stream_out, item_stream_out, bilinear], dim=-1)
-        return self.top_mlp(combined).squeeze(-1)
+        if self.use_streams:
+            us_in = torch.cat([user_e, user_hist_e, dense_e], dim=-1)
+            is_parts = [item_e]
+            if self.use_item_din: is_parts.append(item_hist_e)
+            else: is_parts.append(torch.zeros_like(item_e))
+            is_parts.append(genre_e)
+            if self.use_genome: is_parts.append(genome_field)
+            us = self.user_stream(us_in)
+            its = self.item_stream(torch.cat(is_parts, dim=-1))
+            x = torch.cat([x, us, its, us * its], dim=-1)
 
-
-model = DLRM().to(DEVICE)
-num_params = sum(p.numel() for p in model.parameters())
-log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
-
-# Compile model for CUDA graphs / kernel fusion
-if DEVICE.type == "cuda":
-    model = torch.compile(model)
+        return self.top_mlp(x).squeeze(-1)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TRAINING LOOP — BCE loss
+# TRAIN ONE MODEL VARIANT
 # ═══════════════════════════════════════════════════════════════════
 
-optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
-scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-ACCUM_STEPS = 4
+
+def get_preds(mdl):
+    mdl.eval()
+    scores = []
+    with torch.no_grad():
+        for s in range(0, n_eval, BATCH_SIZE*2):
+            e = min(s + BATCH_SIZE*2, n_eval)
+            u, m = _eval_uids_t[s:e], _eval_mids_t[s:e]
+            logits = mdl(u, m, _eval_dense_t[s:e],
+                         _user_histories_gpu[u], _user_hist_ratings_gpu[u],
+                         _movie_genres_gpu[m], _item_histories_gpu[m],
+                         _item_hist_ratings_gpu[m], _genome_gpu[m], _has_genome_gpu[m])
+            scores.append(torch.sigmoid(logits).cpu().numpy())
+    return np.concatenate(scores)
+
+def train_one(model_kwargs, seed=42, lr=LR, wd=WEIGHT_DECAY, accum=4,
+              patience=3, label_smooth=0.05, recency_frac=0.8):
+    torch.manual_seed(seed)
+    model = DLRM(**model_kwargs).to(DEVICE)
+    if DEVICE.type == "cuda":
+        model = torch.compile(model)
+    # Get training data for this recency fraction
+    t_uids, t_mids, t_dense, t_labels = get_recency_data(recency_frac)
+    nt = len(t_labels)
+    nbpe = nt // BATCH_SIZE
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    crit = nn.BCEWithLogitsLoss()
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    best_auc, best_state, no_imp, gstep = 0.0, None, 0, 0
+    eval_every = max(nbpe // 3, 1)
+    t0 = time.time()
+    for _ in range(20):
+        model.train()
+        perm = torch.randperm(nt, device=DEVICE)
+        for i in range(nbpe):
+            idx = perm[i*BATCH_SIZE:(i+1)*BATCH_SIZE]
+            u, m = t_uids[idx], t_mids[idx]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(u, m, train_dense[idx],
+                               _user_histories_gpu[u], _user_hist_ratings_gpu[u],
+                               _movie_genres_gpu[m], _item_histories_gpu[m],
+                               _item_hist_ratings_gpu[m], _genome_gpu[m], _has_genome_gpu[m])
+                loss = crit(logits, t_labels[idx] * (1-2*label_smooth) + label_smooth)
+            scaler.scale(loss / accum).backward()
+            if (i+1) % accum == 0:
+                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+            gstep += 1
+            if gstep % eval_every == 0:
+                preds = get_preds(model)
+                auc = evaluate(_eval_labels, preds)["auc"]
+                if auc > best_auc:
+                    best_auc = auc; best_state = copy.deepcopy(model.state_dict()); no_imp = 0
+                else:
+                    no_imp += 1
+                if no_imp >= patience: break
+                model.train()
+        if no_imp >= patience: break
+    if best_state: model.load_state_dict(best_state)
+    preds = get_preds(model)
+    elapsed = time.time() - t0
+    del model, opt, scaler; torch.cuda.empty_cache()
+    return preds, best_auc, elapsed
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DIVERSE ENSEMBLE VARIANTS (architecture × HP × seed)
+# ═══════════════════════════════════════════════════════════════════
+
+VARIANTS = [
+    # --- Full model, seed diversity ---
+    {"name": "full_s42",      "model_kwargs": {}, "seed": 42},
+    {"name": "full_s43",      "model_kwargs": {}, "seed": 43},
+    {"name": "full_s44",      "model_kwargs": {}, "seed": 44},
+    # --- Architecture ablations ---
+    {"name": "meanpool",      "model_kwargs": {"use_din": False, "use_causal_sa": False}},
+    {"name": "no_itemdin",    "model_kwargs": {"use_item_din": False}},
+    {"name": "no_genome",     "model_kwargs": {"use_genome": False}},
+    {"name": "no_fieldattn",  "model_kwargs": {"use_field_attn": False}},
+    {"name": "no_streams",    "model_kwargs": {"use_streams": False}},
+    {"name": "minimal",       "model_kwargs": {"use_din": False, "use_item_din": False, "use_causal_sa": False, "use_genome": False, "use_field_attn": False, "use_streams": False}},
+    {"name": "din_only",      "model_kwargs": {"use_item_din": False, "use_genome": False, "use_field_attn": False, "use_streams": False}},
+    # --- Embed dim ---
+    {"name": "dim16",         "model_kwargs": {"embed_dim": 16}},
+    {"name": "dim56",         "model_kwargs": {"embed_dim": 56}},
+    # --- RECENCY DIVERSITY (key for ensemble per Ning) ---
+    {"name": "recent50",      "model_kwargs": {}, "recency_frac": 0.5},
+    {"name": "recent60",      "model_kwargs": {}, "recency_frac": 0.6},
+    {"name": "recent70",      "model_kwargs": {}, "recency_frac": 0.7},
+    {"name": "recent90",      "model_kwargs": {}, "recency_frac": 0.9},
+    {"name": "recent100",     "model_kwargs": {}, "recency_frac": 1.0},
+    # --- Recency × architecture combos ---
+    {"name": "r50_meanpool",  "model_kwargs": {"use_din": False, "use_causal_sa": False}, "recency_frac": 0.5},
+    {"name": "r50_noitemdin", "model_kwargs": {"use_item_din": False}, "recency_frac": 0.5},
+    {"name": "r60_nogenome",  "model_kwargs": {"use_genome": False}, "recency_frac": 0.6},
+    {"name": "r70_dim16",     "model_kwargs": {"embed_dim": 16}, "recency_frac": 0.7},
+    {"name": "r90_s43",       "model_kwargs": {}, "seed": 43, "recency_frac": 0.9},
+    # --- HP diversity ---
+    {"name": "lr_high",       "model_kwargs": {}, "lr": 2e-4},
+    {"name": "lr_low",        "model_kwargs": {}, "lr": 5e-5},
+    {"name": "no_smooth",     "model_kwargs": {}, "label_smooth": 0.0},
+    # --- More arch+seed combos ---
+    {"name": "meanpool_s43",  "model_kwargs": {"use_din": False, "use_causal_sa": False}, "seed": 43},
+    {"name": "nogenome_s43",  "model_kwargs": {"use_genome": False}, "seed": 43},
+]
 
 training_start = time.time()
 peak_memory_mb = 0.0
-best_auc = 0.0
-best_state = None
-evals_without_improvement = 0
-global_step = 0
-eval_every_steps = max(n_batches_per_epoch // 3, 1)  # eval ~3x per epoch
-epoch = 0
+all_preds, all_aucs = {}, {}
 
-while True:
-    model.train()
-    epoch_loss = 0.0
-
-    # Shuffle training data each epoch via random permutation
-    perm = torch.randperm(n_train, device=DEVICE)
-
-    for i in range(n_batches_per_epoch):
-        idx = perm[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
-
-        u_batch = train_uids[idx]
-        m_batch = train_mids[idx]
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            logits = model(
-                u_batch, m_batch, train_dense[idx],
-                _user_histories_gpu[u_batch], _user_hist_ratings_gpu[u_batch],
-                _movie_genres_gpu[m_batch],
-                _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
-                _genome_gpu[m_batch], _has_genome_gpu[m_batch],
-            )
-            # Label smoothing: soft targets
-            smooth_labels = train_labels[idx] * 0.9 + 0.05
-            loss = criterion(logits, smooth_labels)
-
-        scaler.scale(loss / ACCUM_STEPS).backward()
-        if (i + 1) % ACCUM_STEPS == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        epoch_loss += loss.item()
-        global_step += 1
-
-        # Sub-epoch evaluation
-        if global_step % eval_every_steps == 0:
-            avg_loss = epoch_loss / (i + 1)
-            elapsed = time.time() - training_start
-            val_metrics = run_eval()
-            val_auc = val_metrics["auc"]
-            improved = "***" if val_auc > best_auc else ""
-            log.info(f"Step {global_step:6d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
-
-            if val_auc > best_auc:
-                best_auc = val_auc
-                best_state = copy.deepcopy(model.state_dict())
-                evals_without_improvement = 0
-            else:
-                evals_without_improvement += 1
-
-            if evals_without_improvement >= PATIENCE:
-                log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
-                break
-            model.train()
-
-    epoch += 1
-    if evals_without_improvement >= PATIENCE:
-        break
-
-# Record peak CUDA memory after training
-if DEVICE.type == "cuda":
-    peak_memory_mb = torch.cuda.max_memory_allocated(DEVICE) / (1024 * 1024)
+log.info(f"Training {len(VARIANTS)} diverse ensemble variants...")
+for i, v in enumerate(VARIANTS):
+    name = v.pop("name")
+    log.info(f"[{i+1}/{len(VARIANTS)}] {name}...")
+    preds, auc, elapsed = train_one(**v)
+    all_preds[name] = preds
+    all_aucs[name] = auc
+    log.info(f"  {name:20s} | AUC {auc:.4f} | {elapsed:.0f}s")
+    if DEVICE.type == "cuda":
+        peak_memory_mb = max(peak_memory_mb, torch.cuda.max_memory_allocated() / (1024**2))
 
 training_seconds = time.time() - training_start
 
-
 # ═══════════════════════════════════════════════════════════════════
-# EVALUATION
+# ENSEMBLE STACKING
 # ═══════════════════════════════════════════════════════════════════
 
-if best_state is not None:
-    model.load_state_dict(best_state)
-    log.info(f"Restored best model (AUC: {best_auc:.4f})")
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import cross_val_predict
 
-metrics = run_eval()
+names = sorted(all_preds.keys())
+X = np.column_stack([all_preds[n] for n in names])
+y = _eval_labels.astype(int)
+
+log.info(f"\n{'='*60}")
+log.info(f"Trained {len(names)} variants in {training_seconds:.0f}s")
+log.info(f"Individual AUCs: min={min(all_aucs.values()):.4f} max={max(all_aucs.values()):.4f}")
+
+# Simple average
+avg = evaluate(_eval_labels, X.mean(axis=1))["auc"]
+log.info(f"Simple average AUC: {avg:.4f}")
+
+# LogReg stacking (5-fold CV, heavy regularization per Ning: C=0.0005)
+lr_scores = cross_val_predict(
+    LogisticRegression(C=0.0005, max_iter=1000), X, y, cv=5, method="predict_proba")[:, 1]
+lr_auc = evaluate(_eval_labels, lr_scores)["auc"]
+log.info(f"LogReg stacked AUC: {lr_auc:.4f}")
+
+# HistGBM stacking (5-fold CV, conservative settings)
+hgb_scores = cross_val_predict(
+    HistGradientBoostingClassifier(max_iter=100, max_leaf_nodes=15,
+                                   learning_rate=0.05, min_samples_leaf=500,
+                                   max_depth=3, l2_regularization=1.0,
+                                   random_state=42),
+    X, y, cv=5, method="predict_proba")[:, 1]
+hgb_auc = evaluate(_eval_labels, hgb_scores)["auc"]
+log.info(f"HistGBM stacked AUC: {hgb_auc:.4f}")
+
+best_method = max([("avg", avg), ("logreg", lr_auc), ("histgbm", hgb_auc)], key=lambda x: x[1])
+log.info(f"Best: {best_method[0]} ({best_method[1]:.4f})")
+
+if best_method[0] == "histgbm":
+    metrics = evaluate(_eval_labels, hgb_scores)
+elif best_method[0] == "logreg":
+    metrics = evaluate(_eval_labels, lr_scores)
+else:
+    metrics = evaluate(_eval_labels, X.mean(axis=1))
+
+num_params = len(names)
 total_seconds = time.time() - total_start
-
 print_summary(metrics, training_seconds, total_seconds, peak_memory_mb, num_params, stats)
