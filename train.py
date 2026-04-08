@@ -168,6 +168,13 @@ train_t = build_tensors(train_df)
 val_t = build_tensors(val_df)
 n_train = train_t[0].shape[0]
 n_val = val_t[0].shape[0]
+
+# Sample weights: exponentially upweight recent training samples
+ts_vals = train_df["timestamp"].values.astype(np.float64)
+ts_normalized = (ts_vals - ts_vals.min()) / (ts_vals.max() - ts_vals.min() + 1.0)
+sample_weights = torch.from_numpy(np.exp(2.0 * ts_normalized).astype(np.float32)).to(DEVICE)
+sample_weights = sample_weights / sample_weights.mean()  # normalize to mean=1
+
 log.info(f"Tensors on GPU. Train: {n_train}, Val: {n_val}")
 
 
@@ -235,7 +242,7 @@ def run_eval():
 # ═══════════════════════════════════════════════════════════════════
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-criterion = nn.BCEWithLogitsLoss()
+criterion = nn.BCEWithLogitsLoss(reduction='none')  # per-sample loss for weighting
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -264,7 +271,7 @@ while True:
 
         logits = model(train_t[0][idx], train_t[1][idx], train_t[2][idx],
                        train_t[3][idx], train_t[4][idx])
-        loss = criterion(logits, train_t[5][idx])
+        loss = (criterion(logits, train_t[5][idx]) * sample_weights[idx]).mean()
 
         optimizer.zero_grad()
         loss.backward()
