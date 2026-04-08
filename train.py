@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from prepare import load_data, evaluate, print_summary, TIME_BUDGET
 
 # ─── Logging ────────────────────────────────────────────────────────
@@ -30,7 +29,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
-# Force unbuffered stdout so logs appear in real time when redirected
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 log = logging.getLogger("train")
@@ -42,17 +40,12 @@ LR = 1e-3
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
-NUM_DENSE = 7  # 1 timestamp + 3 user stats + 3 item stats
-EVAL_EVERY = 5  # evaluate on val set every N epochs
-PATIENCE = 20  # early stop after N evals with no improvement
+# NUM_DENSE is computed dynamically after feature engineering
+EVALS_PER_EPOCH = 3  # sub-epoch evaluation
+PATIENCE = 6  # early stop after N evals with no improvement
 
 # ─── Device ─────────────────────────────────────────────────────────
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-else:
-    DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 log.info(f"Device: {DEVICE}")
 
 # ─── Load Data ──────────────────────────────────────────────────────
@@ -66,7 +59,7 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING (modify freely)
+# FEATURE ENGINEERING
 # ═══════════════════════════════════════════════════════════════════
 
 # 1. Genre multi-hot encoding
@@ -85,129 +78,126 @@ for _, row in movies_df.iterrows():
             if g in genre_to_idx:
                 movie_genres[mid, genre_to_idx[g]] = 1.0
 
-# 2. User and item statistics (computed on train only)
-user_stats = np.zeros((num_users, 3), dtype=np.float32)  # count, mean_rating, std_rating
-item_stats = np.zeros((num_items, 3), dtype=np.float32)
+# 2. User and item statistics with rating histograms + raw mean
+RATING_BINS = [(0, 2.5), (2.5, 3.5), (3.5, 4.0), (4.0, 4.5), (4.5, 5.5)]
+NUM_BINS = len(RATING_BINS)
+# 7 features each: log_count, mean_rating, pos_rate, 5 histogram bins
+STAT_DIM = 2 + NUM_BINS + 1  # log_count + mean + pos_rate + 5 bins
+global_mean = float(train_df["rating"].mean())
+global_pos_rate = float(train_df["label"].mean())
+
+user_stats = np.zeros((num_users, STAT_DIM), dtype=np.float32)
+item_stats = np.zeros((num_items, STAT_DIM), dtype=np.float32)
+# Defaults for missing users/items
+user_stats[:, 1] = global_mean
+user_stats[:, 2] = global_pos_rate
+user_stats[:, 3:] = 1.0 / NUM_BINS
+item_stats[:, 1] = global_mean
+item_stats[:, 2] = global_pos_rate
+item_stats[:, 3:] = 1.0 / NUM_BINS
 
 for uid, group in train_df.groupby("userId"):
     r = group["rating"].values.astype(np.float32)
-    user_stats[uid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
+    labels = group["label"].values.astype(np.float32)
+    user_stats[uid, 0] = np.log1p(len(r))
+    user_stats[uid, 1] = r.mean()
+    user_stats[uid, 2] = labels.mean()
+    for b, (lo, hi) in enumerate(RATING_BINS):
+        user_stats[uid, 3 + b] = ((r >= lo) & (r < hi)).mean()
 
 for mid, group in train_df.groupby("movieId"):
     r = group["rating"].values.astype(np.float32)
-    item_stats[mid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
+    labels = group["label"].values.astype(np.float32)
+    item_stats[mid, 0] = np.log1p(len(r))
+    item_stats[mid, 1] = r.mean()
+    item_stats[mid, 2] = labels.mean()
+    for b, (lo, hi) in enumerate(RATING_BINS):
+        item_stats[mid, 3 + b] = ((r >= lo) & (r < hi)).mean()
 
-# Normalize to zero mean, unit variance
-for arr in [user_stats, item_stats]:
-    for col in range(arr.shape[1]):
-        mu = arr[:, col].mean()
-        sigma = arr[:, col].std() + 1e-8
-        arr[:, col] = (arr[:, col] - mu) / sigma
+NUM_DENSE = 3 + 2 * STAT_DIM  # timestamp + user_recency + item_recency + user_stats + item_stats
 
-# 3. User history sequences (last HISTORY_LEN items from training data)
-PAD_IDX = num_items  # padding token for history embedding
+# 3. Temporal features: last interaction timestamp per user/item
+ts_min = float(train_df["timestamp"].min())
+ts_max = float(train_df["timestamp"].max())
+ts_range = ts_max - ts_min + 1.0
+
+user_last_ts = np.full(num_users, ts_min, dtype=np.float64)
+item_last_ts = np.full(num_items, ts_min, dtype=np.float64)
+for uid, group in train_df.groupby("userId"):
+    user_last_ts[uid] = group["timestamp"].max()
+for mid, group in train_df.groupby("movieId"):
+    item_last_ts[mid] = group["timestamp"].max()
+
+# 4. User history sequences
+PAD_IDX = num_items
 user_histories = np.full((num_users, HISTORY_LEN), PAD_IDX, dtype=np.int64)
 for uid, group in train_df.groupby("userId"):
     items = group["movieId"].values
     seq = items[-HISTORY_LEN:]
     user_histories[uid, -len(seq):] = seq
 
-# 4. Timestamp normalization parameters (from training data)
-ts_min = float(train_df["timestamp"].min())
-ts_range = float(train_df["timestamp"].max() - ts_min) + 1.0
+
+# ═══════════════════════════════════════════════════════════════════
+# PRE-COMPUTE & MOVE ALL TENSORS TO GPU
+# ═══════════════════════════════════════════════════════════════════
+
+def build_tensors(df):
+    uids = df["userId"].values.astype(np.int64)
+    mids = df["movieId"].values.astype(np.int64)
+    labels = df["label"].values.astype(np.float32)
+    ts = df["timestamp"].values.astype(np.float64)
+    ts_norm = ((ts - ts_min) / ts_range).astype(np.float32)
+    # Recency: how long ago was the user/item's last training interaction?
+    user_recency = ((ts - user_last_ts[uids]) / ts_range).astype(np.float32)
+    item_recency = ((ts - item_last_ts[mids]) / ts_range).astype(np.float32)
+    dense = np.column_stack([ts_norm, user_recency, item_recency,
+                             user_stats[uids], item_stats[mids]]).astype(np.float32)
+    hist = user_histories[uids]
+    genres = movie_genres[mids]
+    return (
+        torch.from_numpy(uids).to(DEVICE),
+        torch.from_numpy(mids).to(DEVICE),
+        torch.from_numpy(dense).to(DEVICE),
+        torch.from_numpy(hist).to(DEVICE),
+        torch.from_numpy(genres).to(DEVICE),
+        torch.from_numpy(labels).to(DEVICE),
+    )
+
+log.info("Pre-computing and moving tensors to GPU...")
+train_t = build_tensors(train_df)
+val_t = build_tensors(val_df)
+n_train = train_t[0].shape[0]
+n_val = val_t[0].shape[0]
+
+# Sample weights: exponentially upweight recent training samples
+ts_vals = train_df["timestamp"].values.astype(np.float64)
+ts_normalized = (ts_vals - ts_vals.min()) / (ts_vals.max() - ts_vals.min() + 1.0)
+sample_weights = torch.from_numpy(np.exp(2.0 * ts_normalized).astype(np.float32)).to(DEVICE)
+sample_weights = sample_weights / sample_weights.mean()  # normalize to mean=1
+
+log.info(f"Tensors on GPU. Train: {n_train}, Val: {n_val}")
 
 
 # ═══════════════════════════════════════════════════════════════════
-# DATASET (modify freely)
+# MODEL
 # ═══════════════════════════════════════════════════════════════════
 
-class RecDataset(Dataset):
-    def __init__(self, df):
-        self.user_ids = df["userId"].values.astype(np.int64)
-        self.movie_ids = df["movieId"].values.astype(np.int64)
-        self.labels = df["label"].values.astype(np.float32)
-        self.ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        uid = self.user_ids[idx]
-        mid = self.movie_ids[idx]
-        dense = np.concatenate([
-            [self.ts_norm[idx]],
-            user_stats[uid],
-            item_stats[mid],
-        ])
-        return (
-            uid,                        # int64
-            mid,                        # int64
-            dense,                      # float32[NUM_DENSE]
-            user_histories[uid],        # int64[HISTORY_LEN]
-            movie_genres[mid],          # float32[num_genres]
-            self.labels[idx],           # float32
-        )
-
-
-train_loader = DataLoader(
-    RecDataset(train_df), batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=0, pin_memory=False, drop_last=True,
-)
-val_loader = DataLoader(
-    RecDataset(val_df), batch_size=BATCH_SIZE * 2, shuffle=False,
-    num_workers=0,
-)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MODEL (modify freely)
-# ═══════════════════════════════════════════════════════════════════
-
-class DLRM(nn.Module):
-    """
-    Deep Learning Recommendation Model.
-
-    Architecture:
-      - Bottom MLP transforms dense features → embed_dim
-      - Sparse features (user, item, genre, history) each → embed_dim
-      - Feature interaction: pairwise dot products of all embedding vectors
-      - Top MLP: concat of dot products + embedding vectors → logit
-    """
+class RecModel(nn.Module):
+    """Dense-feature MLP with user/item bias embeddings."""
 
     def __init__(self):
         super().__init__()
-        D = EMBED_DIM
+        # User/item bias: single scalar learned per user/item
+        self.user_bias = nn.Embedding(num_users, 1)
+        self.item_bias = nn.Embedding(num_items, 1)
 
-        # Sparse embeddings
-        self.user_embed = nn.Embedding(num_users, D)
-        self.item_embed = nn.Embedding(num_items, D)
-        self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
-
-        # Bottom MLP for dense features
-        self.bottom_mlp = nn.Sequential(
-            nn.Linear(NUM_DENSE, 64),
-            nn.ReLU(),
-            nn.Linear(64, D),
-            nn.ReLU(),
+        # MLP on dense features + genres
+        self.mlp = nn.Sequential(
+            nn.Linear(NUM_DENSE + num_genres, 256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 1),
         )
-
-        # Genre projection (multi-hot → embed_dim)
-        self.genre_proj = nn.Sequential(
-            nn.Linear(num_genres, D),
-            nn.ReLU(),
-        )
-
-        # Top MLP: 5 vectors → C(5,2)=10 dots + 5*D features
-        self.top_mlp = nn.Sequential(
-            nn.Linear(10 + 5 * D, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 1),
-        )
-
         self._init_weights()
 
     def _init_weights(self):
@@ -217,39 +207,16 @@ class DLRM(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, 0.0, 0.01)
-                if m.padding_idx is not None:
-                    nn.init.zeros_(m.weight[m.padding_idx])
+                nn.init.zeros_(m.weight)
 
     def forward(self, user_id, movie_id, dense, history, genres):
-        # Embed sparse features
-        user_e = self.user_embed(user_id)           # (B, D)
-        item_e = self.item_embed(movie_id)           # (B, D)
-
-        # History: embed → masked mean pooling
-        hist_e = self.hist_embed(history)             # (B, L, D)
-        mask = (history != PAD_IDX).unsqueeze(-1).float()  # (B, L, 1)
-        hist_e = (hist_e * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # (B, D)
-
-        # Dense features through bottom MLP
-        dense_e = self.bottom_mlp(dense)              # (B, D)
-
-        # Genre multi-hot through projection
-        genre_e = self.genre_proj(genres)             # (B, D)
-
-        # Feature interaction: pairwise dot products
-        vecs = [user_e, item_e, hist_e, dense_e, genre_e]
-        dots = []
-        for i in range(len(vecs)):
-            for j in range(i + 1, len(vecs)):
-                dots.append((vecs[i] * vecs[j]).sum(dim=-1, keepdim=True))
-
-        # Concatenate dots + original vectors → top MLP
-        out = torch.cat(dots + vecs, dim=-1)
-        return self.top_mlp(out).squeeze(-1)
+        mlp_out = self.mlp(torch.cat([dense, genres], dim=-1))
+        u_bias = self.user_bias(user_id)
+        i_bias = self.item_bias(movie_id)
+        return (mlp_out + u_bias + i_bias).squeeze(-1)
 
 
-model = DLRM().to(DEVICE)
+model = RecModel().to(DEVICE)
 num_params = sum(p.numel() for p in model.parameters())
 log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 
@@ -258,27 +225,24 @@ log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
+@torch.no_grad()
 def run_eval():
-    """Evaluate current model on validation set. Returns metrics dict."""
     model.eval()
-    all_labels, all_scores = [], []
-    with torch.no_grad():
-        for user_id, movie_id, dense, history, genres, label in val_loader:
-            logits = model(
-                user_id.to(DEVICE), movie_id.to(DEVICE), dense.to(DEVICE),
-                history.to(DEVICE), genres.to(DEVICE),
-            )
-            all_scores.append(torch.sigmoid(logits).cpu().numpy())
-            all_labels.append(label.numpy())
-    return evaluate(np.concatenate(all_labels), np.concatenate(all_scores))
+    all_scores = []
+    for i in range(0, n_val, BATCH_SIZE * 4):
+        end = min(i + BATCH_SIZE * 4, n_val)
+        logits = model(val_t[0][i:end], val_t[1][i:end], val_t[2][i:end],
+                       val_t[3][i:end], val_t[4][i:end])
+        all_scores.append(torch.sigmoid(logits).cpu().numpy())
+    return evaluate(val_t[5].cpu().numpy(), np.concatenate(all_scores))
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TRAINING LOOP (modify freely)
+# TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════════
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-criterion = nn.BCEWithLogitsLoss()
+criterion = nn.BCEWithLogitsLoss(reduction='none')  # per-sample loss for weighting
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -286,29 +250,28 @@ epoch = 0
 best_auc = 0.0
 best_state = None
 evals_without_improvement = 0
+total_batches = (n_train + BATCH_SIZE - 1) // BATCH_SIZE
+eval_interval = max(1, total_batches // EVALS_PER_EPOCH)
 
 while True:
-    elapsed = time.time() - training_start
-    if elapsed >= TIME_BUDGET:
+    if time.time() - training_start >= TIME_BUDGET:
         break
 
+    perm = torch.randperm(n_train, device=DEVICE)
     model.train()
     epoch_loss = 0.0
     n_batches = 0
 
-    for user_id, movie_id, dense, history, genres, label in train_loader:
+    for start in range(0, n_train, BATCH_SIZE):
         if time.time() - training_start >= TIME_BUDGET:
             break
 
-        user_id = user_id.to(DEVICE)
-        movie_id = movie_id.to(DEVICE)
-        dense = dense.to(DEVICE)
-        history = history.to(DEVICE)
-        genres = genres.to(DEVICE)
-        label = label.to(DEVICE)
+        end = min(start + BATCH_SIZE, n_train)
+        idx = perm[start:end]
 
-        logits = model(user_id, movie_id, dense, history, genres)
-        loss = criterion(logits, label)
+        logits = model(train_t[0][idx], train_t[1][idx], train_t[2][idx],
+                       train_t[3][idx], train_t[4][idx])
+        loss = (criterion(logits, train_t[5][idx]) * sample_weights[idx]).mean()
 
         optimizer.zero_grad()
         loss.backward()
@@ -317,37 +280,34 @@ while True:
         epoch_loss += loss.item()
         n_batches += 1
 
-        # Track MPS memory
-        if DEVICE.type == "mps":
-            try:
-                mem = torch.mps.current_allocated_memory() / (1024 * 1024)
-                peak_memory_mb = max(peak_memory_mb, mem)
-            except Exception:
-                pass
+        if n_batches % eval_interval == 0:
+            peak_memory_mb = max(peak_memory_mb, torch.cuda.max_memory_allocated() / (1024**2))
+            avg_loss = epoch_loss / n_batches
+            val_metrics = run_eval()
+            val_auc = val_metrics["auc"]
+            elapsed = time.time() - training_start
+            improved = "***" if val_auc > best_auc else ""
+            log.info(f"Epoch {epoch+1} batch {n_batches}/{total_batches} | "
+                     f"Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | "
+                     f"{elapsed:.0f}s / {TIME_BUDGET}s")
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_state = copy.deepcopy(model.state_dict())
+                evals_without_improvement = 0
+            else:
+                evals_without_improvement += 1
+            if evals_without_improvement >= PATIENCE:
+                log.info(f"Early stopping: {PATIENCE} evals without improvement (best: {best_auc:.4f})")
+                break
+            model.train()
+
+    if evals_without_improvement >= PATIENCE:
+        break
 
     epoch += 1
     avg_loss = epoch_loss / max(n_batches, 1)
     elapsed = time.time() - training_start
-
-    # Periodic validation with early stopping
-    if epoch % EVAL_EVERY == 0:
-        val_metrics = run_eval()
-        val_auc = val_metrics["auc"]
-        improved = "***" if val_auc > best_auc else ""
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s / {TIME_BUDGET}s")
-
-        if val_auc > best_auc:
-            best_auc = val_auc
-            best_state = copy.deepcopy(model.state_dict())
-            evals_without_improvement = 0
-        else:
-            evals_without_improvement += 1
-
-        if evals_without_improvement >= PATIENCE:
-            log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
-            break
-    else:
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | {elapsed:.0f}s / {TIME_BUDGET}s")
+    log.info(f"Epoch {epoch} done | Loss {avg_loss:.4f} | {elapsed:.0f}s / {TIME_BUDGET}s")
 
 training_seconds = time.time() - training_start
 
@@ -356,7 +316,6 @@ training_seconds = time.time() - training_start
 # EVALUATION (do not modify — uses prepare.evaluate)
 # ═══════════════════════════════════════════════════════════════════
 
-# Restore best model if we have one
 if best_state is not None:
     model.load_state_dict(best_state)
     log.info(f"Restored best model (AUC: {best_auc:.4f})")

@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(conda info:*)",
+      "Bash(/usr/condabin/conda info:*)",
+      "Bash(mgt --help)",
+      "Bash(pip3 install:*)",
+      "Bash(pip config:*)",
+      "Read(//home/mengwei/.pip/**)",
+      "Read(//etc/**)",
+      "Bash(venv/bin/pip config:*)",
+      "Bash(venv/bin/pip install:*)",
+      "Bash(nvidia-smi)",
+      "Bash(env)",
+      "Bash(curl -s https://pypi.fburl.com)",
+      "Bash(curl -s http://fwdproxy:8080)",
+      "Bash(HTTPS_PROXY=http://fwdproxy:8080 venv/bin/pip install torch pandas numpy scikit-learn scipy lightgbm)",
+      "Bash(mkdir -p /home/mengwei/auto-movielens/data)",
+      "Bash(HTTPS_PROXY=http://fwdproxy:8080 curl -L -o ml-100k.zip https://files.grouplens.org/datasets/movielens/ml-100k.zip)",
+      "Bash(unzip ml-100k.zip)",
+      "Bash(rm ml-100k.zip)",
+      "Bash(HTTPS_PROXY=http://fwdproxy:8080 curl -L -o ml-25m.zip https://files.grouplens.org/datasets/movielens/ml-25m.zip)",
+      "Bash(unzip ml-25m.zip)",
+      "Bash(rm ml-25m.zip)",
+      "Bash(HTTPS_PROXY=http://fwdproxy:8082 curl -sL -o /dev/null -w \"%{http_code}\" \"https://files.grouplens.org/datasets/movielens/ml-100k.zip\")",
+      "Bash(HTTPS_PROXY=http://fwdproxy-ash:8080 curl -sL -o /dev/null -w \"%{http_code}\" \"https://files.grouplens.org/datasets/movielens/ml-100k.zip\")",
+      "Bash(unzip -o ml-100k.zip)",
+      "Bash(unzip -o ml-1m.zip)",
+      "Bash(unzip -o ml-10m.zip)",
+      "Bash(unzip -o ml-25m.zip)",
+      "Bash(rm *.zip)"
+    ]
+  }
+}

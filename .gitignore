@@ -3,3 +3,4 @@ run.log
 *.pyc
 __pycache__/
 results.tsv
+venv/
