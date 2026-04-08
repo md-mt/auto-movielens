@@ -163,28 +163,19 @@ log.info(f"Tensors on GPU. Train: {n_train}, Val: {n_val}")
 # ═══════════════════════════════════════════════════════════════════
 
 class RecModel(nn.Module):
-    """Wide & Deep with additive logits."""
+    """Dense-feature MLP with user/item bias embeddings."""
 
     def __init__(self):
         super().__init__()
-        D = EMBED_DIM
-        self.user_embed = nn.Embedding(num_users, D)
-        self.item_embed = nn.Embedding(num_items, D)
-        self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
-        self.genre_proj = nn.Linear(num_genres, D)
+        # User/item bias: single scalar learned per user/item
+        self.user_bias = nn.Embedding(num_users, 1)
+        self.item_bias = nn.Embedding(num_items, 1)
 
-        # Wide: raw dense + genres → logit
-        self.wide = nn.Sequential(
-            nn.Linear(NUM_DENSE + num_genres, 128), nn.ReLU(),
+        # MLP on dense features + genres
+        self.mlp = nn.Sequential(
+            nn.Linear(NUM_DENSE + num_genres, 256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1),
             nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-
-        # Deep: embeddings → logit
-        deep_in = 1 + 4 * D
-        self.deep = nn.Sequential(
-            nn.Linear(deep_in, 128), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(64, 1),
         )
         self._init_weights()
@@ -196,23 +187,13 @@ class RecModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, 0.0, 0.01)
-                if m.padding_idx is not None:
-                    nn.init.zeros_(m.weight[m.padding_idx])
+                nn.init.zeros_(m.weight)
 
     def forward(self, user_id, movie_id, dense, history, genres):
-        user_e = self.user_embed(user_id)
-        item_e = self.item_embed(movie_id)
-        hist_e = self.hist_embed(history)
-        mask = (history != PAD_IDX).unsqueeze(-1).float()
-        hist_e = (hist_e * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-        genre_e = self.genre_proj(genres)
-
-        dot = (user_e * item_e).sum(dim=-1, keepdim=True)
-        deep_out = self.deep(torch.cat([dot, user_e, item_e, hist_e, genre_e], dim=-1))
-        wide_out = self.wide(torch.cat([dense, genres], dim=-1))
-
-        return (wide_out + deep_out).squeeze(-1)
+        mlp_out = self.mlp(torch.cat([dense, genres], dim=-1))
+        u_bias = self.user_bias(user_id)
+        i_bias = self.item_bias(movie_id)
+        return (mlp_out + u_bias + i_bias).squeeze(-1)
 
 
 model = RecModel().to(DEVICE)
